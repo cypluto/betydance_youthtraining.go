@@ -1,0 +1,55 @@
+package main
+
+import (
+   "bufio"
+   "fmt"
+   "math/rand" //生成随机数的包
+   "os"
+   "strconv"
+   "strings"
+   "time"
+)
+
+//初始化随机数资源库，避免产生伪随机
+func init() {
+   rand.Seed(time.Now().UnixNano())
+}
+func main() {
+   maxNum := 100 //设置生成随机数的上限
+
+   //rand是生成随机数的函数
+   //rand.Init()生成的是一个伪随机数，即程序运行多少次生成的随机数都是这一个
+   //调用 rand.Seed (), 并且传入一个变化的值作为参数，如 time.Now().UnixNano() , 就是可以生成时刻变化的值
+   secretNumber := rand.Intn(maxNum) //左闭右开区间
+
+   //fmt.Println("The secret number is", secretNumber)
+
+   fmt.Println("Please input your guess")
+   // bufio.NewReader()是一种读取文件的方式
+   reader := bufio.NewReader(os.Stdin) //从标准输入中接收数据 返回缓存区的一个切片
+   for {
+      input, err := reader.ReadString('\n')
+      //以'\n'给间隔符 \n之后的数据不再读取
+      // 其实这里并没多大用因为os.Stdin就是读取一行的数据 但是必须要输入参数
+      //input 存放从缓存中读取的数据
+      if err != nil {
+         fmt.Println("An error occured while reading input. Please try again", err)
+         continue
+      }
+      input = strings.TrimSuffix(input, "\n") //除去指定后缀
+      guess, err := strconv.Atoi(input) //string型转int型
+      if err != nil {
+         fmt.Println("Invalid input. Please enter an integer value")
+         return
+      }
+      fmt.Println("You guess is", guess)
+      if guess > secretNumber {
+         fmt.Println("Your guess is bigger than the secret number. Please try again")
+      } else if guess < secretNumber {
+         fmt.Println("Your guess is smaller than the secret number. Please try again")
+      } else {
+         fmt.Println("Correct, you Legend!")
+         break
+      }
+   }
+}
