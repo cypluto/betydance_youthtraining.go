@@ -1,0 +1,199 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+)
+
+const (
+	socks5Ver = 0x05
+	cmdBind   = 0x01
+	atypIPV4  = 0x01
+	atypeHOST = 0x03
+	atypeIPV6 = 0x04
+)
+
+func main() {
+	server, err := net.Listen("tcp", "127.0.0.1:1080")
+	if err != nil {
+		panic(err)
+	}
+	for {
+		client, err := server.Accept()
+		if err != nil {
+			log.Printf("Accept failed $v", err)
+			continue
+		}
+		go process(client)
+	}
+}
+
+func process(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	err := auth(reader, conn)
+	if err != nil {
+		log.Printf("client %v auth falied:%v", conn.RemoteAddr(), err) //失败打印日志
+		return
+	}
+	err = connect(reader, conn)
+	if err != nil {
+		log.Printf("client %v auth failed:%v", conn.RemoteAddr(), err)
+		return
+	}
+}
+
+func auth(reader *bufio.Reader, conn net.Conn) (err error) {
+	//客户端向代理服务器发起握手请求
+	// +----+----------+----------+
+	// |VER | NMETHODS | METHODS  |
+	// +----+----------+----------+
+	// | 1  |    1     | 1 to 255 |
+	// +----+----------+----------+
+	// VER: 协议版本，socks5为0x05
+	// NMETHODS: 支持认证的方法数量
+	// METHODS: 对应NMETHODS，NMETHODS的值为多少，METHODS就有多少个字节。(每个认证方法的编码)
+	//RFC预定义了一些值的含义，内容如下:
+	//常用的认证方法编码方式
+	// X’00’ NO AUTHENTICATION REQUIRED 0表示不需要认证
+	// X’02’ USERNAME/PASSWORD 2代表认证用户名和密码
+	//前两个信息是一个字节的我们可以用ReadByte()读取一个字节
+	ver, err := reader.ReadByte()
+	if err != nil {
+		return fmt.Errorf("read ver failed:%w", err)
+	}
+	//如果读取的协议版本不是socks5Ver 打印错误日志
+	if ver != socks5Ver {
+		return fmt.Errorf("not supported ver:%v", ver)
+	}
+	methodSize, err := reader.ReadByte()
+	if err != nil {
+		return fmt.Errorf("read methodSize failed:%w", err)
+	}
+	//方法的编码有多少个字节是由方法数决定的 一个方法对应一个编码
+	method := make([]byte, methodSize)   //创建一个methodSize这么大的缓冲区
+	_, err = io.ReadFull(reader, method) //用ReaderFull（）将它填充满
+	if err != nil {
+		return fmt.Errorf("read method failed:%w", err)
+	}
+	log.Println("ver", ver, "method", method)
+	//代理服务器在收到客户端发起的请求之后, 向客户端发回握手响应
+	// +----+--------+
+	// |VER | METHOD |
+	// +----+--------+
+	// | 1  |   1    |
+	// +----+--------+
+	//其中 VER 字段与客户端请求数据包的 VER 字段含义相同, 表征协议版本, 固定为 0x05
+	//METHOD 字段表征代理服务器所选择的认证方法, 长度为 1 字节, 当然代理服务器可能对于客户端所声明的所有认证方法都不支持,
+	//此时代理服务器将 METHOD 字段值为 0xFF, 客户端收到该数据包时便知晓代理服务器不支持自己所声明的认证方法,
+	//即协商失败, 客户端应主动关闭 TCP 连接
+	_, err = conn.Write([]byte{socks5Ver, 0x00}) //0X00代表选择的认证方式是不认证
+	if err != nil {
+		return fmt.Errorf("write failed:%w", err)
+	}
+	return nil
+}
+
+func connect(reader *bufio.Reader, conn net.Conn) (err error) {
+	//当认证过程通过后, Socks 握手正式完成, 此时客户端向代理服务器发起正式请求以指示所要访问的目标进程的地址, 端口等信息
+	//其数据包格式如下所示:
+	// +----+-----+-------+------+----------+----------+
+	// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+	// +----+-----+-------+------+----------+----------+
+	// | 1  |  1  | X'00' |  1   | Variable |    2     |
+	// +----+-----+-------+------+----------+----------+
+	// VER 版本号，socks5的值为0x05
+	// CMD 0x01表示CONNECT请求
+	// RSV 保留字段，值为0x00
+	// ATYP 目标地址类型，DST.ADDR的数据对应这个字段的类型。
+	//   0x01表示IPv4地址，DST.ADDR为4个字节
+	//   0x03表示域名，DST.ADDR是一个可变长度的域名
+	// DST.ADDR 一个可变长度的值
+	// DST.PORT 目标端口，固定2个字节
+
+	//开始读取每个字段的信息
+	buf := make([]byte, 4)            //前四个字段是定长的，我们创建4个字节的缓冲区来存储这四个字段的信息
+	_, err = io.ReadFull(reader, buf) //把buf填充满
+	if err != nil {
+		return fmt.Errorf("read header failed:%w", err)
+	}
+	ver, cmd, atyp := buf[0], buf[1], buf[3]
+	if ver != socks5Ver {
+		return fmt.Errorf("not supported ver:%v", ver)
+	}
+	if cmd != cmdBind {
+		return fmt.Errorf("not supported cmd:%v", ver)
+	}
+	addr := "" //变长字符串来读取DST.ADDR中的信息
+	switch atyp {
+	case atypIPV4: //IPV4 长度为4byte，复用创建的buf
+		_, err = io.ReadFull(reader, buf)
+		if err != nil {
+			return fmt.Errorf("read atyp failed:%w", err)
+		}
+		addr = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
+	case atypeHOST: //变长字符串：域名
+		//host先读取他的字节长度一个byte，再构建hostSize大小的缓冲区将信息填充进去
+		hostSize, err := reader.ReadByte()
+		if err != nil {
+			return fmt.Errorf("read hostSize failed:%w", err)
+		}
+		host := make([]byte, hostSize)
+		_, err = io.ReadFull(reader, host)
+		if err != nil {
+			return fmt.Errorf("read host failed:%w", err)
+		}
+		addr = string(host)
+	case atypeIPV6:
+		return errors.New("IPv6: no supported yet")
+	default:
+		return errors.New("invalid atyp")
+	}
+	//读取DST.PORT
+	_, err = io.ReadFull(reader, buf[:2])
+	if err != nil {
+		return fmt.Errorf("read port failed:%w", err)
+	}
+	port := binary.BigEndian.Uint16(buf[:2])                       //binary里面的函数BigEndian（大端方式）解析该数据将其转换为无符号的int16
+	dest, err := net.Dial("tcp", fmt.Sprintf("%v:%v", addr, port)) //Sprintf格式化输出
+	if err != nil {
+		return fmt.Errorf("dial dst failed:%w", err)
+	}
+	defer dest.Close()
+	log.Println("dial", addr, port) //打印日志
+
+	//代理服务器在收到以上请求后，返回数据包形式：
+	// +----+-----+-------+------+----------+----------+
+	// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+	// +----+-----+-------+------+----------+----------+
+	// | 1  |  1  | X'00' |  1   | Variable |    2     |
+	// +----+-----+-------+------+----------+----------+
+	// VER socks版本，这里为0x05
+	// REP Relay field,内容取值如下 X’00’ succeeded
+	// RSV 保留字段
+	// ATYPE 地址类型
+	// BND.ADDR 服务绑定的地址
+	// BND.PORT 服务绑定的端口DST.PORT
+	_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //很多字段都不是socks5代理需要使用的
+	if err != nil {
+		return fmt.Errorf("write failed: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_, _ = io.Copy(dest, reader) //从用户浏览器copy数据到服务器
+		cancel()
+	}()
+	go func() {
+		_, _ = io.Copy(conn, dest) //从底层服务器copy数据到用户浏览器
+		cancel()
+	}()
+	<-ctx.Done() //等待ctx.Done()被执行 也是cancel()函数被调用的时机
+	return nil
+}
